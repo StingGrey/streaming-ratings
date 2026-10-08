@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         流媒体评分助手（IMDb / 烂番茄 / Metacritic / 豆瓣）
 // @namespace    https://github.com/StingGrey/streaming-ratings
-// @version      0.2.0
+// @version      0.3.0
 // @homepageURL  https://github.com/StingGrey/streaming-ratings
 // @supportURL   https://github.com/StingGrey/streaming-ratings/issues
 // @updateURL    https://raw.githubusercontent.com/StingGrey/streaming-ratings/main/streaming-ratings.user.js
@@ -23,6 +23,11 @@
 // @connect      movie.douban.com
 // @connect      search.douban.com
 // @connect      www.wikidata.org
+// @connect      zh.wikipedia.org
+// @connect      v3-cinemeta.strem.io
+// @connect      cinemeta-live.strem.io
+// @connect      cinemeta-catalogs.strem.io
+// @connect      api.tvmaze.com
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -203,14 +208,18 @@
   }
 
   // 豆瓣搜索页直接认 IMDb 编号，比按片名搜准得多（英文名在 suggest 接口里经常搜不到）
-  async function searchDoubanByImdb(tt) {
+  async function doubanSearchPage(q) {
     const { data } = await request(
-      `https://search.douban.com/movie/subject_search?search_text=${encodeURIComponent(tt)}&cat=1002`,
+      `https://search.douban.com/movie/subject_search?search_text=${encodeURIComponent(q)}&cat=1002`,
       true,
     );
     const d = extractJsonAfter(data, 'window.__DATA__');
-    const x = d && (d.items || []).find((it) => it.tpl_name === 'search_subject' && it.id);
-    if (!x) return null;
+    // 请求太频繁会被跳到 sec.douban.com 人机验证页；抛错而不是返回空，免得把"没找到"缓存下来
+    if (!d) throw new Error('豆瓣搜索页被限流，稍后再试');
+    return ((d && d.items) || []).filter((it) => it.tpl_name === 'search_subject' && it.id);
+  }
+
+  function doubanItem(x) {
     const v = x.rating && x.rating.value;
     return {
       id: String(x.id),
@@ -218,6 +227,123 @@
       rate: v ? Number(v).toFixed(1) : '',
       url: x.url || `https://movie.douban.com/subject/${x.id}/`,
     };
+  }
+
+  async function searchDoubanByImdb(tt) {
+    const x = (await doubanSearchPage(tt))[0];
+    return x ? doubanItem(x) : null;
+  }
+
+  // 豆瓣兜底：suggest 接口搜不到时，用完整搜索页按片名搜（英文名也认）
+  async function searchDoubanPage(title, year, kind) {
+    const q = norm(title);
+    if (!q) return null;
+    const items = (await doubanSearchPage(title.trim())).slice(0, 6);
+    let best = null;
+    let bestD = Infinity;
+    for (const it of items) {
+      if (!norm(it.title).includes(q)) continue;
+      const m = /\((\d{4})\)/.exec(it.title);
+      const y = m ? +m[1] : null;
+      // 豆瓣会收未播出的占位条目（年份写到 2040 之类），一律跳过
+      if (y && y > new Date().getFullYear() + 1) continue;
+      let d = 0;
+      if (year && y) {
+        // 电影卡 ±1 年；剧集页面年份常是最新一季，只要求不晚于它，越接近越好
+        if (kind === 'show' ? y > year + 1 : Math.abs(y - year) > 1) continue;
+        d = Math.abs(y - year);
+      }
+      // 名字完全一致（去掉季数）优先
+      if (norm(it.title.replace(/\(\d{4}\)\s*$/, '')) !== q) d += 0.5;
+      if (d < bestD) {
+        bestD = d;
+        best = it;
+      }
+    }
+    return best ? doubanItem(best) : null;
+  }
+
+  // 播出年份区间，如 "2021–2025" / "2023-" / "2010"
+  function yearRange(s) {
+    const m = /^(\d{4})(?:\s*[-–]\s*(\d{4})?)?/.exec(s || '');
+    if (!m) return null;
+    const a = +m[1];
+    return [a, /[-–]/.test(m[0]) ? +m[2] || 9999 : a];
+  }
+
+  // Cinemeta（Stremio 的公开元数据服务，免 key）：片名搜索带别名，中文名也常能搜到
+  const CM = 'https://v3-cinemeta.strem.io';
+  async function searchCinemeta(title, year, kind) {
+    const q = title.trim().slice(0, 100);
+    if (!q) return null;
+    const types = kind === 'show' ? ['series'] : kind === 'movie' ? ['movie'] : ['series', 'movie'];
+    let best = null;
+    let bestScore = -Infinity;
+    for (const t of types) {
+      const { data } = await request(`${CM}/catalog/${t}/top/search=${encodeURIComponent(q)}.json`);
+      ((data && data.metas) || []).slice(0, 5).forEach((m, i) => {
+        const id = m.imdb_id || m.id;
+        if (!/^tt\d+$/.test(id || '')) return;
+        const ts = titleScore(m.name, title);
+        const r = yearRange(m.releaseInfo);
+        const yearOk = year && r ? year >= r[0] - 1 && year <= r[1] + 1 : null;
+        // 名字对不上（译名）时只信前两条、且首播年份几乎一致的，不然开放区间（如 2007–）会捞到无关老剧
+        if (!ts && (i > 1 || !r || !year || Math.abs(r[0] - year) > 1)) return;
+        if (ts && yearOk === false) return;
+        const s = (ts || 1) - i * 0.3 + (yearOk ? 2 : 0);
+        if (s > bestScore) {
+          bestScore = s;
+          best = { id, title: m.name || '', year: r ? r[0] : null, type: t === 'series' ? 'show' : 'movie' };
+        }
+      });
+    }
+    return best;
+  }
+
+  // Cinemeta 的条目详情带 imdbRating，没填 key 或 MDBList/OMDb 出错时拿来兜 IMDb 分
+  async function cinemetaMeta(imdb) {
+    // 类型猜错时 Cinemeta 照样回同一个编号，评分是对的，但片名/年份会是别的片
+    const one = async (t) => {
+      const { data } = await request(`${CM}/meta/${t}/${imdb.id}.json`).catch(() => ({ data: null }));
+      const m = data && data.meta;
+      if (!m || (m.imdb_id || m.id) !== imdb.id || !(m.imdbRating || m.name)) return null;
+      const r = yearRange(m.releaseInfo);
+      return { rating: m.imdbRating || '', name: m.name || '', year: r ? r[0] : null, type: t === 'series' ? 'show' : 'movie' };
+    };
+    if (imdb.type) return one(imdb.type === 'show' ? 'series' : 'movie');
+
+    const [mv, sr] = await Promise.all([one('movie'), one('series')]);
+    if (!mv || !sr) return mv || sr;
+    if (norm(mv.name) === norm(sr.name)) return mv;
+    // 两边片名不一致：有已知片名就按片名选，否则只要评分、不要片名
+    if (imdb.title) return titleScore(sr.name, imdb.title) > titleScore(mv.name, imdb.title) ? sr : mv;
+    return { rating: mv.rating || sr.rating, name: '', year: null, type: null };
+  }
+
+  // TVmaze：剧集专用，免 key，带 IMDb 编号；只认英文名
+  async function searchTvmaze(title) {
+    const q = title.trim().slice(0, 100);
+    if (!q || !/[a-z]/i.test(q)) return null;
+    const { status, data } = await request(`https://api.tvmaze.com/singlesearch/shows?q=${encodeURIComponent(q)}`).catch(
+      () => ({ status: 404, data: null }),
+    );
+    if (status !== 200 || !data) return null;
+    const tt = data.externals && data.externals.imdb;
+    if (!/^tt\d+$/.test(tt || '') || !titleScore(data.name, title)) return null;
+    return { id: tt, title: data.name, year: parseInt(data.premiered, 10) || null, type: 'show' };
+  }
+
+  // 中文维基：搜索会做繁简转换，再通过条目关联的 Wikidata 拿 IMDb 编号
+  async function searchZhwiki(title) {
+    const q = title.trim().slice(0, 100);
+    if (!q) return null;
+    const { data } = await request(
+      'https://zh.wikipedia.org/w/api.php?action=query&format=json&origin=*&redirects=1&generator=search' +
+        `&gsrnamespace=0&gsrlimit=4&prop=pageprops&ppprop=wikibase_item&gsrsearch=${encodeURIComponent(q)}`,
+    );
+    const pages = Object.values((data.query && data.query.pages) || {}).sort((a, b) => a.index - b.index);
+    const ids = pages.map((p) => p.pageprops && p.pageprops.wikibase_item).filter(Boolean);
+    return wdImdbFromIds(ids, title);
   }
 
   // Wikidata 兜底：港台译名 IMDb/豆瓣都搜不到时，Wikidata 往往收了 zh-hk / zh-tw 标签并关联 IMDb 编号
@@ -228,15 +354,34 @@
     if (!q) return null;
     const { data: s } = await request(`${WD}action=query&list=search&srnamespace=0&srlimit=5&srsearch=${encodeURIComponent(q)}`);
     const ids = ((s.query && s.query.search) || []).map((x) => x.title).filter((t) => /^Q\d+$/.test(t));
+    return wdImdbFromIds(ids, title);
+  }
+
+  // Wikidata「是一个」(P31) → 电影/剧集，给后面查评分用
+  const WD_SHOW = new Set(['Q5398426', 'Q1259759', 'Q526877', 'Q63952888', 'Q15416', 'Q3464665', 'Q21191270']);
+  const WD_MOVIE = new Set(['Q11424', 'Q24869', 'Q93204', 'Q202866', 'Q506240', 'Q226730', 'Q17517379']);
+  const WD_LANGS = 'en|zh|zh-hans|zh-hant|zh-hk|zh-tw|zh-cn|ja|ko';
+
+  // 搜索结果里常混着无关条目（比如「奧本海默」），必须有标签或别名和页面片名对得上
+  async function wdImdbFromIds(ids, title) {
     if (!ids.length) return null;
-    const { data: e } = await request(`${WD}action=wbgetentities&props=claims|labels&languages=en&ids=${ids.join('|')}`);
+    const { data: e } = await request(
+      `${WD}action=wbgetentities&props=claims|labels|aliases&languages=${WD_LANGS}&ids=${ids.join('|')}`,
+    );
     for (const id of ids) {
       const ent = e.entities && e.entities[id];
       const claim = ent && ent.claims && ent.claims.P345 && ent.claims.P345[0];
       const tt = claim && claim.mainsnak.datavalue && claim.mainsnak.datavalue.value;
       if (!/^tt\d+$/.test(tt || '')) continue;
+      const names = [
+        ...Object.values(ent.labels || {}).map((l) => l.value),
+        ...Object.values(ent.aliases || {}).flat().map((a) => a.value),
+      ];
+      if (title && !names.some((n) => titleScore(n, title) >= 4)) continue;
+      const p31 = ((ent.claims && ent.claims.P31) || []).map((c) => c.mainsnak.datavalue && c.mainsnak.datavalue.value.id);
+      const type = p31.some((q) => WD_SHOW.has(q)) ? 'show' : p31.some((q) => WD_MOVIE.has(q)) ? 'movie' : null;
       const en = ent.labels && ent.labels.en && ent.labels.en.value;
-      return { id: tt, title: en || '', year: null, type: null };
+      return { id: tt, title: en || '', year: null, type };
     }
     return null;
   }
@@ -328,9 +473,10 @@
     const key = infoKey(info);
     const ov = GM_getValue('ov:' + key, {}); // 用户手动纠正过的匹配
     const doubanOn = GM_getValue('doubanEnabled', true);
-    const errors = [];
-    const soft = (label) => (e) => {
-      errors.push(`${label}：${e.message}`);
+    // 出错先记下来；最后某一项已经由别的源查到了，就不再显示那一项的报错
+    const errs = [];
+    const soft = (label, group) => (e) => {
+      errs.push({ group, msg: `${label}：${e.message}` });
       return null;
     };
     const dbSearch = (t, y) => cached(`db:s:${norm(t)}|${y || ''}`, SEARCH_TTL, () => searchDouban(t, y));
@@ -340,53 +486,84 @@
     const dbP = ov.douban
       ? Promise.resolve({ id: ov.douban })
       : doubanOn
-        ? dbSearch(info.title, info.year).catch(soft('豆瓣'))
+        ? dbSearch(info.title, info.year).catch(soft('豆瓣', 'douban'))
         : Promise.resolve(null);
 
     let imdb = null;
     if (ov.imdb) {
       imdb = { id: ov.imdb, type: null, title: '', year: null };
     } else {
-      imdb = await imSearch(info.title, info.year, info.kind).catch(soft('IMDb 搜索'));
+      imdb = await imSearch(info.title, info.year, info.kind).catch(soft('IMDb 搜索', 'imdb'));
       if (!imdb) {
         const db = await dbP;
         const alt = db && db.subTitle && norm(db.subTitle) !== norm(info.title) ? db.subTitle : null;
-        if (alt) imdb = await imSearch(alt, info.year || db.year, info.kind).catch(soft('IMDb 搜索'));
+        if (alt) imdb = await imSearch(alt, info.year || db.year, info.kind).catch(soft('IMDb 搜索', 'imdb'));
       }
-      if (!imdb) {
-        imdb = await cached(`wd:s:${norm(info.title)}`, SEARCH_TTL, () => searchWikidata(info.title)).catch(soft('Wikidata'));
+      // 兜底链：Cinemeta → TVmaze（剧集、英文名）→ 中文维基 → Wikidata，一个命中就停
+      const nt = norm(info.title);
+      const fallbacks = [
+        ['Cinemeta', `cm:s:${nt}|${info.year || ''}|${info.kind || ''}`, () => searchCinemeta(info.title, info.year, info.kind)],
+        ['TVmaze', `tm:s:${nt}`, () => (info.kind === 'movie' ? null : searchTvmaze(info.title))],
+        ['中文维基', `zw:s:${nt}`, () => searchZhwiki(info.title)],
+        ['Wikidata', `wd:s:${nt}`, () => searchWikidata(info.title)],
+      ];
+      for (const [label, ck, fn] of fallbacks) {
+        if (imdb) break;
+        imdb = await cached(ck, SEARCH_TTL, fn).catch(soft(label, 'imdb'));
       }
     }
 
     const provider = pickProvider();
     let ratings = {};
     if (imdb && provider) {
-      ratings = (await cached(`r:${provider.name}:${imdb.id}`, RATING_TTL, () => provider.fetch(imdb)).catch(soft('评分'))) || {};
+      ratings = (await cached(`r:${provider.name}:${imdb.id}`, RATING_TTL, () => provider.fetch(imdb)).catch(soft('评分', 'rating'))) || {};
+    }
+    // 没 key 或 MDBList/OMDb 出错时，用 Cinemeta 兜 IMDb 分；顺便补全 Wikidata/手动指定时缺的片名年份
+    if (imdb && (!ratings.imdb || !imdb.title)) {
+      const cm = await cached(`cm:m:${imdb.id}`, RATING_TTL, () => cinemetaMeta(imdb)).catch(soft('Cinemeta', 'rating'));
+      if (cm) {
+        if (!ratings.imdb && cm.rating) ratings = { ...ratings, imdb: { text: cm.rating, votes: null } };
+        imdb = { ...imdb, title: imdb.title || cm.name, year: imdb.year || cm.year, type: imdb.type || cm.type };
+      }
     }
 
     let douban = null;
     if (doubanOn || ov.douban) {
       // 优先用 IMDb 编号反查豆瓣；查不到再用片名搜索的结果
       if (!ov.douban && imdb) {
-        douban = await cached(`db:tt:${imdb.id}`, RATING_TTL, () => searchDoubanByImdb(imdb.id)).catch(soft('豆瓣'));
+        douban = await cached(`db:tt:${imdb.id}`, RATING_TTL, () => searchDoubanByImdb(imdb.id)).catch(soft('豆瓣', 'douban'));
       }
       if (!douban) {
+        // 搜索页被限流时，退回 suggest 接口（按片名，限流宽松得多）
         let db = await dbP;
         if (!db && imdb && imdb.title && norm(imdb.title) !== norm(info.title)) {
-          db = await dbSearch(imdb.title, imdb.year || info.year).catch(soft('豆瓣'));
+          db = await dbSearch(imdb.title, imdb.year || info.year).catch(soft('豆瓣', 'douban'));
         }
         if (db) {
-          const r = await cached(`db:r:${db.id}`, RATING_TTL, () => doubanRating(db.id)).catch(soft('豆瓣评分'));
+          const r = await cached(`db:r:${db.id}`, RATING_TTL, () => doubanRating(db.id)).catch(soft('豆瓣评分', 'douban'));
           douban = { ...db, ...(r || {}) };
+        }
+      }
+      // 最后用豆瓣完整搜索页按片名搜（页面片名、IMDb 英文名各试一次）
+      if (!douban && !ov.douban) {
+        const names = [info.title, imdb && imdb.title].filter((t, i, a) => t && a.findIndex((u) => norm(u) === norm(t)) === i);
+        for (const t of names) {
+          douban = await cached(`db:p:${norm(t)}|${info.year || ''}`, SEARCH_TTL, () => searchDoubanPage(t, info.year, info.kind)).catch(soft('豆瓣', 'douban'));
+          if (douban) break;
         }
       }
     }
 
+    const solved = { imdb: !!imdb, douban: !!douban, rating: !!ratings.imdb };
+    const errors = errs.filter((e) => !solved[e.group]).map((e) => e.msg);
     return { imdb, ratings, douban, provider: provider ? provider.name : null, errors };
   }
 
   if (TEST) {
-    Object.assign(TEST, { norm, searchImdb, searchDouban, searchDoubanByImdb, doubanRating, lookup, infoKey });
+    Object.assign(TEST, {
+      norm, searchImdb, searchDouban, searchDoubanByImdb, searchDoubanPage, searchCinemeta, cinemetaMeta,
+      searchTvmaze, searchZhwiki, searchWikidata, doubanRating, lookup, infoKey,
+    });
     return;
   }
 

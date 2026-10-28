@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         流媒体评分助手（IMDb / 烂番茄 / Metacritic / 豆瓣）
 // @namespace    https://github.com/StingGrey/streaming-ratings
-// @version      0.4.0
+// @version      0.5.0
 // @homepageURL  https://github.com/StingGrey/streaming-ratings
 // @supportURL   https://github.com/StingGrey/streaming-ratings/issues
 // @updateURL    https://raw.githubusercontent.com/StingGrey/streaming-ratings/main/streaming-ratings.user.js
@@ -31,6 +31,8 @@
 // @connect      cinemeta-catalogs.strem.io
 // @connect      api.tvmaze.com
 // @connect      api.bgm.tv
+// @connect      cdn.jsdelivr.net
+// @connect      unpkg.com
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -53,7 +55,7 @@
         method: opts.method || 'GET',
         url,
         data: opts.body,
-        timeout: 15000,
+        timeout: opts.timeout || 15000,
         headers: { Accept: asText ? 'text/html' : 'application/json', ...opts.headers },
         onload: (r) => {
           if (asText) return resolve({ status: r.status, data: r.responseText || '' });
@@ -756,13 +758,104 @@
     return bgmItem(data);
   }
 
+  // ---------------------------------------------------------------- bangumi-data：站点 ID → Bangumi 条目
+
+  // 社区维护的动画数据表（github.com/bangumi-data/bangumi-data），记着巴哈「作品資料」ID、
+  // Crunchyroll 剧集 ID 对应的 Bangumi 条目，有它就不用猜台湾译名
+  // 一周下一次（压缩后 1 MB 出头），只留这两张对照表；jsDelivr 在国内时好时坏，失败换 unpkg
+  const BD_URLS = [
+    'https://cdn.jsdelivr.net/npm/bangumi-data@0.3/dist/data.json',
+    'https://unpkg.com/bangumi-data@0.3/dist/data.json',
+  ];
+  const BD_SITES = { gamer: 'gamer', gamer_hk: 'gamer', crunchyroll: 'crunchyroll' };
+
+  async function fetchBangumiData() {
+    let data = null;
+    let err = null;
+    for (const url of BD_URLS) {
+      try {
+        const r = await request(url, false, { timeout: 60000 });
+        if (r.status < 400 && r.data && Array.isArray(r.data.items)) {
+          data = r.data;
+          break;
+        }
+        err = new Error('HTTP ' + r.status);
+      } catch (e) {
+        err = e;
+      }
+    }
+    if (!data) throw new Error('bangumi-data 下载失败：' + err.message);
+    // { gamer: { 站点 ID: [[Bangumi ID, 首播日期, 名字们], …] }, crunchyroll: {…} }
+    const maps = { gamer: {}, crunchyroll: {} };
+    for (const it of data.items) {
+      const ids = {};
+      for (const x of it.sites || []) if (x.id) ids[x.site] = x.id;
+      if (!ids.bangumi) continue;
+      const row = [ids.bangumi, it.begin ? it.begin.slice(0, 10) : '', [it.title, ...Object.values(it.titleTranslate || {}).flat()]];
+      for (const [site, key] of Object.entries(BD_SITES)) {
+        const sid = ids[site];
+        if (!sid) continue;
+        const list = (maps[key][sid] = maps[key][sid] || []);
+        if (!list.some((r) => r[0] === row[0])) list.push(row);
+      }
+    }
+    // 一对一的用不着名字，不存，省空间
+    for (const m of Object.values(maps)) {
+      for (const [k, list] of Object.entries(m)) m[k] = list.length === 1 ? [[list[0][0]]] : list;
+    }
+    return maps;
+  }
+
+  let bdPromise = null;
+  const bangumiData = () => (bdPromise = bdPromise || cached('bd', SEARCH_TTL, fetchBangumiData));
+
+  // 一个 ID 对着好几条（Crunchyroll 常把各季放在同一个剧集页下）：按片名、季数、年份挑，挑不出来取最早那条
+  // 巴哈的续作常沿用同一个作品页、名字也不加季数，「本季新番」卡片上的是正在播的，取已开播的最新那条
+  function bdPick(rows, info) {
+    if (rows.length === 1) return rows[0][0];
+    const sorted = [...rows].sort((a, b) => a[1].localeCompare(b[1]));
+    const today = new Date().toISOString().slice(0, 10);
+    const airing = info.recent && sorted.filter((r) => r[1] && r[1] <= today).pop();
+    if (airing) return airing[0];
+    // 片名没写季数、页面也没年份（Crunchyroll 剧集页就是整个系列），取第一季；
+    // 有的剧集 ID 只收了第 3 期以后（「出租女友」「Food Wars!」），那就不硬挑，交给片名搜索
+    const q = splitSeason(info.title);
+    if (!info.year && q.season === 1 && !q.movie) {
+      const first = sorted.find(([, , names]) => names && names.every((n) => splitSeason(n).season === 1));
+      return first ? first[0] : null;
+    }
+    let best = null;
+    let bestScore = -Infinity;
+    sorted.forEach(([id, begin, names]) => {
+      const x = { name: names[0], name_cn: '', infobox: [{ key: '别名', value: names.slice(1).map((v) => ({ v })) }] };
+      const y = parseInt(begin, 10);
+      let s = bgmTitleScore(x, info.title);
+      if (info.year && y) s += y === info.year ? 3 : Math.abs(y - info.year) === 1 ? 1 : 0;
+      if (s > bestScore) {
+        bestScore = s;
+        best = id;
+      }
+    });
+    return best;
+  }
+
+  // 先按站点 ID 查 bangumi-data，查不到（或下载失败）再按片名搜
   async function lookupBgm(info) {
     const ov = GM_getValue('ov:' + infoKey(info), {});
     let hit = null;
     let fresh = false; // 刚搜出来的结果自带评分，不用再查一次
     const errors = [];
     if (ov.bgm) hit = { id: ov.bgm };
-    else {
+    else if (info.siteId) {
+      const bd = await bangumiData().catch((e) => {
+        errors.push(e.message);
+        return null;
+      });
+      const rows = bd && bd[info.siteId.site] && bd[info.siteId.site][info.siteId.id];
+      const id = rows && bdPick(rows, info);
+      if (id) hit = { id };
+    }
+    if (!hit) {
       hit = await cached(`bgm:s:${norm(info.title)}|${info.year || ''}|${info.recent ? 'r' : ''}`, SEARCH_TTL, () => {
         fresh = true;
         return searchBangumi(info.title, info.year, info.recent);
@@ -778,14 +871,14 @@
         return null;
       });
     }
-    return { bgm, errors };
+    return { bgm, errors: bgm ? [] : errors };
   }
 
   if (TEST) {
     Object.assign(TEST, {
       norm, searchImdb, searchDouban, searchDoubanByImdb, searchDoubanPage, searchCinemeta, cinemetaMeta,
       searchTvmaze, searchZhwiki, searchWikidata, doubanRating, lookup, infoKey,
-      t2s, splitSeason, searchBangumi, bgmSubject, lookupBgm, bgmSearch, bgmNames, bgmTitleScore,
+      t2s, splitSeason, searchBangumi, bgmSubject, lookupBgm, bgmSearch, bgmNames, bgmTitleScore, bangumiData, bdPick,
     });
     return;
   }
@@ -922,18 +1015,27 @@
       },
     },
     // 下面两个动画站只查 Bangumi；列表页的卡片也挂上小角标
+    // siteId(root)：从卡片或页面里拿站点自己的作品 ID，去 bangumi-data 里对
     // cards：sel 卡片、title 片名、year 年份、badgeIn 角标放哪、inline 跟在文字后面、recent 本季新番
     {
       name: 'anigamer',
       host: /^ani\.gamer\.com\.tw$/,
       source: 'bgm',
       isDetail: () => /^\/anime(Video|Ref)\.php/.test(location.pathname),
+      // 收藏按钮的 onclick 是 animefun.toggleGather(作品資料 ID, 動畫 sn, …)；播放页还有「作品資料」链接
+      siteId(root) {
+        const b = root.querySelector('[onclick*="toggleGather"]');
+        const m = (b && /toggleGather\(\s*(\d+)/.exec(b.getAttribute('onclick'))) ||
+          /acgDetail\.php\?s=(\d+)/.exec((root.querySelector('a[href*="acgDetail.php?s="]') || {}).href || '');
+        return m ? { site: 'gamer', id: m[1] } : null;
+      },
       extract() {
         const h1 = document.querySelector('.anime_name h1');
         const first = [...document.querySelectorAll('.type-list .type')].find((li) => /首播/.test(textOf(li.querySelector('.title'))));
         return {
           title: aniTitle(h1 ? h1.textContent : cleanDocTitle()),
           year: findYear(first && first.querySelector('.content')),
+          siteId: this.siteId(document.querySelector('.anime_name') || document),
           anchor: document.querySelector('.anime_name .anime_info_detail') || h1,
           mode: 'after',
           theme: 'auto', // 巴哈有亮色和暗色两种主题
@@ -950,19 +1052,27 @@
       host: /(^|\.)crunchyroll\.com$/,
       source: 'bgm',
       isDetail: () => /\/(series|watch)\//.test(location.pathname),
+      siteId(root) {
+        const a = root.matches && root.matches('a[href*="/series/"]') ? root : root.querySelector('a[href*="/series/"]');
+        const m = a && /\/series\/(\w+)/.exec(a.getAttribute('href'));
+        return m ? { site: 'crunchyroll', id: m[1] } : null;
+      },
       extract() {
         const hero = document.querySelector('[data-t="series-hero-body"]');
         if (hero) {
           const t = firstText(['h1'], hero);
+          const m = /\/series\/(\w+)/.exec(location.pathname);
           return {
             title: t ? t.text : cleanDocTitle(),
+            siteId: m ? { site: 'crunchyroll', id: m[1] } : null,
             anchor: hero.querySelector('[data-t="ratings-wrapper"]') || (t && t.el),
             mode: 'after',
           };
         }
         // 播放页：拿剧集名，拿不到就不显示（document.title 是单集标题，对不上）
         const t = firstText(['[data-t="show-title-link"] h4', 'a.show-title-link h4', 'a[href*="/series/"] h4'], document);
-        return t && { title: t.text, anchor: t.el.closest('a') || t.el, mode: 'after' };
+        const a = t && t.el.closest('a');
+        return t && { title: t.text, siteId: a && this.siteId(a), anchor: a || t.el, mode: 'after' };
       },
       cards: [
         { sel: '[data-t^="series-card"]', title: 'a[aria-label]:not([aria-label=""]), h3, h4', badgeIn: '[class*="poster-wrapper"]', pos: 'left:6px;top:6px' },
@@ -1200,7 +1310,7 @@
   const bgmLimit = limiter(3);
   const cardMemo = new Map();
   const cardLookup = (info) => {
-    const k = `${norm(info.title)}|${info.year || ''}|${info.recent ? 'r' : ''}`;
+    const k = `${norm(info.title)}|${info.year || ''}|${info.recent ? 'r' : ''}|${info.siteId ? info.siteId.id : ''}`;
     if (!cardMemo.has(k)) cardMemo.set(k, bgmLimit(() => lookupBgm(info)));
     return cardMemo.get(k);
   };
@@ -1211,7 +1321,7 @@
   async function loadCard(card) {
     const st = cardState.get(card);
     if (!st) return;
-    const res = await cardLookup({ title: st.title, year: st.year, recent: st.conf.recent }).catch(() => null);
+    const res = await cardLookup({ title: st.title, year: st.year, recent: st.conf.recent, siteId: st.siteId }).catch(() => null);
     // 等结果的工夫卡片可能被 SPA 换成了别的片
     if (cardState.get(card) !== st || !res || !res.bgm) return;
     st.host = makeBadge(res.bgm);
@@ -1236,7 +1346,8 @@
         // 已经处理过、片名没变、角标还在（或者还在查）就跳过；React 重绘把角标弄掉了就重挂
         if (st && st.title === title && (!st.host || st.host.isConnected)) continue;
         if (st && st.host) st.host.remove();
-        cardState.set(card, { title, year: conf.year ? findYear(card.querySelector(conf.year)) : null, conf, host: null });
+        const year = conf.year ? findYear(card.querySelector(conf.year)) : null;
+        cardState.set(card, { title, year, siteId: site.siteId && site.siteId(card), conf, host: null });
         cardObserver.unobserve(card);
         cardObserver.observe(card);
       }
@@ -1358,7 +1469,7 @@
     // 年份/类型往往比片名晚渲染出来，等它们一会儿再查，匹配更准
     if (!cur.started && (info.year || Date.now() - cur.firstSeen > 2000)) {
       cur.started = true;
-      run({ title: info.title, year: info.year, kind: info.kind, source: site.source });
+      run({ title: info.title, year: info.year, kind: info.kind, source: site.source, siteId: info.siteId });
     }
   }
 
